@@ -3,12 +3,11 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::os::unix::process::ExitStatusExt;
 
-use indicatif::{ProgressBar, ProgressStyle};
 use lexopt::prelude::*;
 use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
+use hk_parser::{HkConfig, HkValue, parse_hk};
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Metadata {
@@ -21,7 +20,7 @@ struct Metadata {
 #[derive(Debug, Deserialize, Serialize)]
 struct Description {
     summary: String,
-    long: Vec<String>,
+    long: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -119,7 +118,7 @@ fn parse_config(config_path: &Path, format: &str) -> Result<Config, Box<dyn std:
     let content = fs::read_to_string(config_path)?;
 
     match format {
-        "hk" => parse_hk(&content),
+        "hk" => from_hk(parse_hk(&content)?),
         "toml" => toml::from_str(&content).map_err(|e| e.into()),
         "yaml" => serde_yaml::from_str(&content).map_err(|e| e.into()),
         "json" => serde_json::from_str(&content).map_err(|e| e.into()),
@@ -128,120 +127,90 @@ fn parse_config(config_path: &Path, format: &str) -> Result<Config, Box<dyn std:
     }
 }
 
-fn parse_hk(content: &str) -> Result<Config, Box<dyn std::error::Error>> {
-    let mut metadata = Metadata {
-        name: String::new(),
-        version: String::new(),
-        authors: None,
-        license: None,
-    };
-    let mut description = Description {
-        summary: String::new(),
-        long: Vec::new(),
-    };
-    let mut specs = Specs {
-        languages: Vec::new(),
-        dependencies: HashMap::new(),
-    };
-    let mut runtime: Option<Runtime> = None;
-
-    let mut current_section = "";
-    let mut in_deps = false;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('!') {
-            continue; // comment
-        }
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            current_section = &trimmed[1..trimmed.len() - 1];
-            in_deps = false;
-            continue;
-        }
-        if !(trimmed.starts_with("->") || (in_deps && trimmed.starts_with("-->"))) {
-            continue;
-        }
-
-        let prefix = if trimmed.starts_with("-->") { "-->" } else { "->" };
-        let start_idx = prefix.len();
-        let rest = trimmed[start_idx..].trim();
-
-        let parts: Vec<&str> = rest.splitn(2, "=>").map(|s| s.trim()).collect();
-        let key = parts[0];
-        let value = if parts.len() == 2 { Some(parts[1]) } else { None };
-
-        match current_section {
-            "metadata" => match key {
-                "name" => if let Some(v) = value { metadata.name = v.to_string() },
-                "version" => if let Some(v) = value { metadata.version = v.to_string() },
-                "authors" => if let Some(v) = value { metadata.authors = Some(v.to_string()) },
-                "license" => if let Some(v) = value { metadata.license = Some(v.to_string()) },
-                _ => {}
-            },
-            "description" => match key {
-                "summary" => if let Some(v) = value { description.summary = v.to_string() },
-                "long" => if let Some(v) = value { description.long.push(v.to_string()) },
-                _ => {}
-            },
-            "specs" => {
-                if prefix == "->" {
-                    if let Some(_) = value {
-                        // Unexpected => in top level
-                    } else {
-                        if key == "dependencies" {
-                            in_deps = true;
-                        } else {
-                            specs.languages.push(key.to_string());
-                        }
-                    }
-                } else if prefix == "-->" && in_deps {
-                    if let Some(v) = value {
-                        specs.dependencies.insert(key.to_string(), v.to_string());
-                    }
-                }
-            }
-            "runtime" => {
-                if runtime.is_none() {
-                    runtime = Some(Runtime {
-                        priority: None,
-                        auto_restart: None,
-                    });
-                }
-                if let Some(r) = runtime.as_mut() {
-                    if let Some(v) = value {
-                        match key {
-                            "priority" => r.priority = Some(v.to_string()),
-                            "auto-restart" => r.auto_restart = Some(v == "true"),
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            _ => {}
+fn from_hk(hk: HkConfig) -> Result<Config, Box<dyn std::error::Error>> {
+    fn get_map(hk: &HkConfig, section: &str) -> Result<HashMap<String, HkValue>, Box<dyn std::error::Error>> {
+        if let Some(HkValue::Map(m)) = hk.get(section) {
+            Ok(m.clone())
+        } else {
+            Err(format!("Missing or invalid section {}", section).into())
         }
     }
 
+    fn get_string(map: &HashMap<String, HkValue>, key: &str) -> Result<String, Box<dyn std::error::Error>> {
+        if let Some(HkValue::String(s)) = map.get(key) {
+            Ok(s.clone())
+        } else {
+            Err(format!("Missing or invalid key {}", key).into())
+        }
+    }
+
+    fn get_opt_string(map: &HashMap<String, HkValue>, key: &str) -> Option<String> {
+        map.get(key).and_then(|v| if let HkValue::String(s) = v { Some(s.clone()) } else { None })
+    }
+
+    fn get_opt_bool(map: &HashMap<String, HkValue>, key: &str) -> Option<bool> {
+        get_opt_string(map, key).and_then(|s| s.parse::<bool>().ok())
+    }
+
+    let meta_map = get_map(&hk, "metadata")?;
+
+    let metadata = Metadata {
+        name: get_string(&meta_map, "name")?,
+        version: get_string(&meta_map, "version")?,
+        authors: get_opt_string(&meta_map, "authors"),
+        license: get_opt_string(&meta_map, "license"),
+    };
+
+    let desc_map = get_map(&hk, "description")?;
+
+    let description = Description {
+        summary: get_string(&desc_map, "summary")?,
+        long: get_string(&desc_map, "long")?,
+    };
+
+    let specs_map = get_map(&hk, "specs")?;
+
+    let mut languages: Vec<String> = Vec::new();
+    let mut dependencies: HashMap<String, String> = HashMap::new();
+
+    for (k, v) in specs_map {
+        if k == "dependencies" {
+            if let HkValue::Map(sub) = v {
+                for (sk, sv) in sub {
+                    if let HkValue::String(ss) = sv {
+                        dependencies.insert(sk, ss);
+                    }
+                }
+            }
+        } else if let HkValue::String(_) = v {
+            languages.push(k);
+        }
+    }
+
+    let specs = Specs {
+        languages,
+        dependencies,
+    };
+
+    let runtime = if let Ok(run_map) = get_map(&hk, "runtime") {
+        Some(Runtime {
+            priority: get_opt_string(&run_map, "priority"),
+            auto_restart: get_opt_bool(&run_map, "auto-restart"),
+        })
+    } else {
+        None
+    };
+
     Ok(Config {
         metadata,
-       description,
-       specs,
-       runtime,
+        description,
+        specs,
+        runtime,
     })
 }
 
 fn setup(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", "Setting up project...".blue().bold());
-
-    let pb = ProgressBar::new(100);
-    pb.set_style(ProgressStyle::default_bar()
-    .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
-    .unwrap()
-    .progress_chars("#>-"));
-
-    for i in 0..100 {
-        pb.set_position(i);
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
 
     let config_path = path.join("hbuild.config");
     if config_path.exists() {
@@ -262,23 +231,13 @@ fn make(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             Ok(config) => {
                 println!("{}", format!("Building project: {}", config.metadata.name).blue().bold());
 
-                let pb = ProgressBar::new(100);
-                pb.set_style(ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
-                .unwrap()
-                .progress_chars("#>-"));
-
                 // Install dependencies (simulated)
-                pb.set_message("Installing dependencies...");
-                for _ in 0..50 {
-                    pb.inc(1);
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
+                println!("{}", "Installing dependencies...".cyan());
 
                 // Build based on languages
-                pb.set_message("Building...");
+                println!("{}", "Building...".cyan());
                 for lang in &config.specs.languages {
-                    pb.println(format!("Building for {}...", lang).cyan().to_string());
+                    println!("{}", format!("Building for {}...", lang).cyan());
                     let build_result = match lang.as_str() {
                         "rust" => {
                             Command::new("cargo").arg("build").current_dir(path).status()
@@ -307,7 +266,7 @@ fn make(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                             Command::new("valac").args(&["--pkg", "gio-2.0", "main.vala"]).current_dir(path).status() // example
                         }
                         _ => {
-                            pb.println(format!("Unsupported language: {}", lang).yellow().to_string());
+                            println!("{}", format!("Unsupported language: {}", lang).yellow());
                             Ok(std::process::ExitStatus::from_raw(0))
                         }
                     };
@@ -323,13 +282,7 @@ fn make(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                for _ in 50..100 {
-                    pb.inc(1);
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-
-                pb.finish_with_message("Build complete!");
-                println!("{}", "Build successful!".green().bold());
+                println!("{}", "Build complete!".green().bold());
             }
             Err(e) => {
                 eprintln!("{}", format!("Config parse error: {}", e).red().bold());
@@ -343,12 +296,6 @@ fn make(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
 fn clean(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", "Cleaning project...".blue().bold());
-
-    let pb = ProgressBar::new(100);
-    pb.set_style(ProgressStyle::default_bar()
-    .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
-    .unwrap()
-    .progress_chars("#>-"));
 
     // Clean based on project type
     if path.join("Cargo.toml").exists() {
@@ -365,11 +312,6 @@ fn clean(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     }
     // Add more for other build systems
 
-    for i in 0..100 {
-        pb.set_position(i);
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-
     println!("{}", "Clean complete!".green().bold());
     Ok(())
-}
+        }
